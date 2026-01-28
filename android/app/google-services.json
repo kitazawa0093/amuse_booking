@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "43720258053",
+    "project_id": "amuse-to",
+    "storage_bucket": "amuse-to.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:43720258053:android:8d687fe218c49952afe26c",
+        "android_client_info": {
+          "package_name": "com.ryo.amuse_booking"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAceBE_4358iEmWhA2Xqj1JkYWRaPRVZaQ"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
