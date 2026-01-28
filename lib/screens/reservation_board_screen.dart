@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:cloud_functions/cloud_functions.dart';
+import 'package:url_launcher/url_launcher.dart';
 import 'package:flutter_stripe/flutter_stripe.dart';
 
 
@@ -37,8 +38,8 @@ class _ReservationBoardScreenState extends State<ReservationBoardScreen> {
   final List<String> sports = const [
     'サイバープレイヤーズ',
     'ビアポン',
-    'ダーツA',
-    'ダーツB',
+    'ダーツ１F',
+    'ダーツ２F',
   ];
 
   late final Map<String, List<Reservation>> reservations;
@@ -157,13 +158,23 @@ class _ReservationBoardScreenState extends State<ReservationBoardScreen> {
       minute: selected.inMinutes % 60,
     );
     final endMinutes = selected.inMinutes + 30;
-    final end = TimeOfDay(
+    final defaultEnd = TimeOfDay(
       hour: endMinutes ~/ 60,
       minute: endMinutes % 60,
     );
 
+    final adjustedEnd = _adjustEndTime(sport, start, defaultEnd);
+
+    // 調整後の長さが0以下なら予約不可
+    if (_absMinute(adjustedEnd) - _absMinute(start) <= 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('その時間帯は予約が埋まっています')),
+      );
+      return;
+    }
+
     // ★ 重複チェック
-    if (_isOverlapping(sport, start, end)) {
+    if (_isOverlapping(sport, start, adjustedEnd)) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('その時間帯は既に予約があります')),
       );
@@ -171,7 +182,11 @@ class _ReservationBoardScreenState extends State<ReservationBoardScreen> {
     }
     setState(() {
       reservations[sport]!.add(
-        Reservation(name: nameCtrl.text.trim(), start: start, end: end),
+        Reservation(
+          name: nameCtrl.text.trim(),
+          start: start,
+          end: adjustedEnd,
+        ),
       );
     });
   }
@@ -238,6 +253,50 @@ class _ReservationBoardScreenState extends State<ReservationBoardScreen> {
       return true;
     } catch (e) {
       debugPrint('Stripe payment error: $e');
+      return false;
+    }
+  }
+
+  Future<bool> _startPayPayPayment({required int people}) async {
+    try {
+      final functions = FirebaseFunctions.instance;
+
+      final result = await functions
+          .httpsCallable('createBeerpongPayPayPayment')
+          .call({
+            'peopleCount': people,
+          });
+
+      final paymentUrl = result.data['paymentUrl'] as String?;
+      if (paymentUrl == null || paymentUrl.isEmpty) {
+        throw Exception('PayPay paymentUrl is missing');
+      }
+
+      final uri = Uri.parse(paymentUrl);
+      final launched = await launchUrl(uri, mode: LaunchMode.externalApplication);
+      if (!launched) return false;
+
+      if (!mounted) return false;
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('PayPay決済'),
+          content: const Text('PayPayでの決済が完了したら「完了」を押してください。'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('キャンセル'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('完了'),
+            ),
+          ],
+        ),
+      );
+      return confirmed == true;
+    } catch (e) {
+      debugPrint('PayPay payment error: $e');
       return false;
     }
   }
@@ -371,6 +430,7 @@ class _ReservationBoardScreenState extends State<ReservationBoardScreen> {
     Duration selected = const Duration(hours: 18);
     final nameCtrl = TextEditingController();
     int people = 2;
+    var paymentMethod = 'card'; // 'card' or 'paypay'
 
     final ok = await showModalBottomSheet<bool>(
       context: context,
@@ -450,6 +510,27 @@ class _ReservationBoardScreenState extends State<ReservationBoardScreen> {
                 ),
 
                 const SizedBox(height: 12),
+                // ===== 決済方法選択 =====
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    ChoiceChip(
+                      label: const Text('カード (Stripe)'),
+                      selected: paymentMethod == 'card',
+                      onSelected: (_) =>
+                          setLocalState(() => paymentMethod = 'card'),
+                    ),
+                    const SizedBox(width: 8),
+                    ChoiceChip(
+                      label: const Text('PayPay'),
+                      selected: paymentMethod == 'paypay',
+                      onSelected: (_) =>
+                          setLocalState(() => paymentMethod = 'paypay'),
+                    ),
+                  ],
+                ),
+
+                const SizedBox(height: 12),
                 FilledButton(
                   onPressed: nameCtrl.text.trim().isEmpty
                       ? null
@@ -466,25 +547,37 @@ class _ReservationBoardScreenState extends State<ReservationBoardScreen> {
 
     if (ok != true) return;
 
-    final paymentOk = await _startStripePayment(
-      people: people,
-    );
-
-    if (!paymentOk) return;
-
-    // ===== 決済成功後に予約を確定 =====
     final start = TimeOfDay(
       hour: selected.inHours,
       minute: selected.inMinutes % 60,
     );
     final endMinutes = selected.inMinutes + 30;
-    final end = TimeOfDay(
+    final defaultEnd = TimeOfDay(
       hour: endMinutes ~/ 60,
       minute: endMinutes % 60,
     );
 
+    final adjustedEnd = _adjustEndTime('ビアポン', start, defaultEnd);
+
+    // 調整後の長さが0以下なら予約不可
+    if (_absMinute(adjustedEnd) - _absMinute(start) <= 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('その時間帯は予約が埋まっています')),
+      );
+      return;
+    }
+
+    bool paymentOk = false;
+    if (paymentMethod == 'paypay') {
+      paymentOk = await _startPayPayPayment(people: people);
+    } else {
+      paymentOk = await _startStripePayment(people: people);
+    }
+
+    if (!paymentOk) return;
+
     // ★ 重複チェック
-    if (_isOverlapping('ビアポン', start, end)) {
+    if (_isOverlapping('ビアポン', start, adjustedEnd)) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('その時間帯は既に予約があります')),
       );
@@ -496,7 +589,7 @@ class _ReservationBoardScreenState extends State<ReservationBoardScreen> {
         Reservation(
           name: '${nameCtrl.text}（$people人）',
           start: start,
-          end: end,
+          end: adjustedEnd,
         ),
       );
     });
@@ -531,14 +624,12 @@ class _ReservationBoardScreenState extends State<ReservationBoardScreen> {
   bool _isOverlapping(String sport, TimeOfDay newStart, TimeOfDay newEnd) {
     final list = reservations[sport]!;
 
-    int toMin(TimeOfDay t) => t.hour * 60 + t.minute;
-
-    final ns = toMin(newStart);
-    final ne = toMin(newEnd);
+    final ns = _absMinute(newStart);
+    final ne = _absMinute(newEnd);
 
     for (final r in list) {
-      final es = toMin(r.start);
-      final ee = toMin(r.end);
+      final es = _absMinute(r.start);
+      final ee = _absMinute(r.end);
 
       // 時間帯が重なったら予約不可
       if (ns < ee && ne > es) {
@@ -546,6 +637,47 @@ class _ReservationBoardScreenState extends State<ReservationBoardScreen> {
       }
     }
     return false;
+  }
+
+  // ===== ヘルパー: 時刻計算 =====
+  int _absMinute(TimeOfDay t) => t.hour * 60 + t.minute;
+
+  TimeOfDay _fromAbsMinute(int totalMinutes) {
+    return TimeOfDay(
+      hour: totalMinutes ~/ 60,
+      minute: totalMinutes % 60,
+    );
+  }
+
+  /// 30分デフォルト終了時刻を、次の予約開始までに収まるように短縮
+  TimeOfDay _adjustEndTime(
+    String sport,
+    TimeOfDay start,
+    TimeOfDay defaultEnd,
+  ) {
+    final startMin = _absMinute(start);
+    final defaultEndMin = _absMinute(defaultEnd);
+    final nextStartMin = _findNextReservationStart(sport, startMin);
+
+    if (nextStartMin != null && nextStartMin < defaultEndMin) {
+      // 次の予約が30分以内にあるので、そこまでで切る
+      return _fromAbsMinute(nextStartMin);
+    }
+    return defaultEnd;
+  }
+
+  /// 指定種目の中で、startMin 以降の最も近い予約開始を返す
+  int? _findNextReservationStart(String sport, int startMin) {
+    int? nearest;
+    for (final r in reservations[sport]!) {
+      final rStart = _absMinute(r.start);
+      if (rStart >= startMin) {
+        if (nearest == null || rStart < nearest) {
+          nearest = rStart;
+        }
+      }
+    }
+    return nearest;
   }
 
 

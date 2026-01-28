@@ -2,9 +2,10 @@ import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'login_screen.dart';
-import 'package:flutter_stripe/flutter_stripe.dart';
 import 'package:cloud_functions/cloud_functions.dart';
 import 'dart:async';  // ←ファイル先頭に追加（Timer使うため）
+import 'package:url_launcher/url_launcher.dart';
+import 'package:flutter_stripe/flutter_stripe.dart';
 
 
 
@@ -23,6 +24,8 @@ class BookingScreen extends StatefulWidget {
 
 
 
+enum PaymentMethod { stripe, paypay }
+
 class _BookingScreenState extends State<BookingScreen> {
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
   final TextEditingController _beerPongPeopleController = TextEditingController();
@@ -32,6 +35,7 @@ class _BookingScreenState extends State<BookingScreen> {
   bool _notifiedStart5MinBefore = false;
   bool _isPaying = false;
   bool _hasActiveReservation = false;
+  PaymentMethod _paymentMethod = PaymentMethod.stripe;
   Future<String> _myBeerpongStatusFuture = Future.value('');
   Future<String> _shopNextSlotFuture = Future.value('');
 
@@ -224,32 +228,73 @@ Future<void> _submitBeerPongReservation() async {
       'createdAt': FieldValue.serverTimestamp(),
     });
 
-    // ② Cloud Functions 呼び出し（PaymentIntent 作成）
-    final callable =
-        FirebaseFunctions.instance.httpsCallable('createBeerpongPayment');
-
     final peopleCount = int.tryParse(_beerPongPeopleController.text) ?? 1;
+    if (_paymentMethod == PaymentMethod.paypay) {
+      // ②-A PayPay決済
+      final callable = FirebaseFunctions.instance
+          .httpsCallable('createBeerpongPayPayPayment');
 
-    final result = await callable.call({
-      'peopleCount': peopleCount,
-    });
+      final result = await callable.call({
+        'peopleCount': peopleCount,
+        'bookingId': bookingRef.id,
+      });
 
-    final clientSecret = result.data['clientSecret'];
-    debugPrint('Stripe clientSecret: $clientSecret');
+      final paymentUrl = result.data['paymentUrl'] as String?;
+      if (paymentUrl == null || paymentUrl.isEmpty) {
+        throw Exception('PayPay paymentUrl is missing');
+      }
 
-    // ★ Stripeの内部キャッシュを完全リセット
-    await Stripe.instance.resetPaymentSheetCustomer();
+      final uri = Uri.parse(paymentUrl);
+      final launched =
+          await launchUrl(uri, mode: LaunchMode.externalApplication);
+      if (!launched) {
+        throw Exception('Could not launch PayPay payment URL');
+      }
 
-    // ③ Stripe PaymentSheet 初期化
-    await Stripe.instance.initPaymentSheet(
-      paymentSheetParameters: SetupPaymentSheetParameters(
-        paymentIntentClientSecret: clientSecret,
-        merchantDisplayName: 'Amuse Booking',
-      ),
-    );
+      if (!mounted) return;
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('PayPay決済'),
+          content: const Text('PayPayでの決済が完了したら「完了」を押してください。'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('キャンセル'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('完了'),
+            ),
+          ],
+        ),
+      );
 
-    // ④ Stripe PaymentSheet 表示（ここでユーザー決済）
-    await Stripe.instance.presentPaymentSheet();
+      if (confirmed != true) {
+        throw Exception('Payment cancelled');
+      }
+    } else {
+      // ②-B Stripeカード決済
+      final callable =
+          FirebaseFunctions.instance.httpsCallable('createBeerpongPayment');
+
+      final result = await callable.call({
+        'peopleCount': peopleCount,
+        'bookingId': bookingRef.id,
+      });
+
+      final clientSecret = result.data['clientSecret'];
+      debugPrint('Stripe clientSecret: $clientSecret');
+
+      await Stripe.instance.resetPaymentSheetCustomer();
+      await Stripe.instance.initPaymentSheet(
+        paymentSheetParameters: SetupPaymentSheetParameters(
+          paymentIntentClientSecret: clientSecret,
+          merchantDisplayName: 'Amuse Booking',
+        ),
+      );
+      await Stripe.instance.presentPaymentSheet();
+    }
 
     // ⑤ 利用時間計算（店全体の最後の予約から積み上げ）
     final now = DateTime.now();
@@ -270,7 +315,7 @@ Future<void> _submitBeerPongReservation() async {
 
     final endAt = startAt.add(const Duration(minutes: 30));
 
-    // ⑥ paid に更新
+    // ⑥ paid に更新（※本番はFunctions側でpaid確定→Firestore更新が安全）
     await bookingRef.update({
       'paymentStatus': 'paid',
       'startAt': startAt,
@@ -441,6 +486,25 @@ Future<void> _submitBeerPongReservation() async {
               controller: _beerPongPeopleController,
               keyboardType: TextInputType.number,
               decoration: const InputDecoration(labelText: '人数を入力'),
+            ),
+            const SizedBox(height: 8),
+            // 決済方法
+            Wrap(
+              spacing: 8,
+              children: [
+                ChoiceChip(
+                  label: const Text('カード (Stripe)'),
+                  selected: _paymentMethod == PaymentMethod.stripe,
+                  onSelected: (_) =>
+                      setState(() => _paymentMethod = PaymentMethod.stripe),
+                ),
+                ChoiceChip(
+                  label: const Text('PayPay'),
+                  selected: _paymentMethod == PaymentMethod.paypay,
+                  onSelected: (_) =>
+                      setState(() => _paymentMethod = PaymentMethod.paypay),
+                ),
+              ],
             ),
             const SizedBox(height: 8),
 
