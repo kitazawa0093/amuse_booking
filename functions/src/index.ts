@@ -99,12 +99,12 @@ export const createBeerpongPayment = onCall(
   }
 );
 
-export const createBeerpongPayPayPayment = onCall(
+export const createPayPayPayment = onCall(
   {
     secrets: ["PAYPAY_API_KEY", "PAYPAY_API_SECRET", "PAYPAY_MERCHANT_ID"],
   },
   async (request) => {
-    logger.info("createBeerpongPayPayPayment called");
+    logger.info("createPayPayPayment called");
 
     if (!request.auth) {
       throw new Error("ログインが必要です");
@@ -123,19 +123,16 @@ export const createBeerpongPayPayPayment = onCall(
     const apiSecret = process.env.PAYPAY_API_SECRET;
     const merchantId = process.env.PAYPAY_MERCHANT_ID;
 
-    const { peopleCount, bookingId } = request.data;
-    if (typeof peopleCount !== "number" || peopleCount <= 0) {
-      throw new Error("人数を正しく指定してください");
+    const { amount, orderId } = request.data;
+    if (typeof amount !== "number" || amount <= 0) {
+      throw new Error("金額が不正です");
     }
 
-    const amount = peopleCount * 700;
-    const orderId =
-      typeof bookingId === "string" && bookingId
-        ? bookingId
-        : crypto.randomUUID();
+    const merchantPaymentId =
+      typeof orderId === "string" && orderId ? orderId : crypto.randomUUID();
 
     const payload = {
-      merchantPaymentId: orderId,
+      merchantPaymentId,
       amount: { amount, currency: "JPY" },
       codeType: "ORDER_QR",
       redirectUrl: "https://example.com/complete",
@@ -184,7 +181,7 @@ export const createBeerpongPayPayPayment = onCall(
 
       logger.info("PayPay QR created", { codeId: json.data?.codeId });
 
-      return { paymentUrl: url };
+      return { url };
     } catch (e) {
       if (e instanceof Error && e.message.startsWith("PayPay")) throw e;
       logger.error("PayPay error", e);
@@ -285,4 +282,101 @@ export const lineWebhook = onRequest(
   }
 );
 
+export const confirmPayPayPayment = onCall(
+  {
+    secrets: ["PAYPAY_API_KEY", "PAYPAY_API_SECRET", "PAYPAY_MERCHANT_ID"],
+  },
+  async (request) => {
+    if (!request.auth) throw new Error("ログインが必要です");
+
+    const { orderId } = request.data;
+    if (!orderId) throw new Error("orderId missing");
+
+    const bookingRef = db.collection("bookings").doc(orderId);
+    const bookingSnap = await bookingRef.get();
+
+    if (!bookingSnap.exists) throw new Error("予約が存在しません");
+
+    const booking = bookingSnap.data();
+
+    if (booking?.uid !== request.auth.uid) {
+      throw new Error("不正なアクセス");
+    }
+
+    if (booking?.paymentStatus === "paid") {
+      return { success: true };
+    }
+
+    const apiKey = process.env.PAYPAY_API_KEY!;
+    const apiSecret = process.env.PAYPAY_API_SECRET!;
+    const merchantId = process.env.PAYPAY_MERCHANT_ID!;
+
+    const nonce = crypto.randomUUID();
+    const timestamp = Date.now().toString();
+    const body = "";
+
+    const signature = crypto
+      .createHmac("sha256", apiSecret)
+      .update(timestamp + "\n" + nonce + "\n" + body + "\n")
+      .digest("base64");
+
+    const headers = {
+      "X-ASSUME-MERCHANT": merchantId,
+      "X-PAYPAY-API-KEY": apiKey,
+      "X-PAYPAY-NONCE": nonce,
+      "X-PAYPAY-TIMESTAMP": timestamp,
+      "X-PAYPAY-SIGNATURE": signature,
+    };
+
+    const res = await fetch(
+      `https://stg-api.paypay.ne.jp/v2/codes/payments/${orderId}`,
+      { method: "GET", headers }
+    );
+
+    const json = await res.json();
+
+    if (!res.ok) {
+      logger.error("PayPay confirm error", json);
+      throw new Error("支払い確認失敗");
+    }
+
+    if (json.data?.status !== "COMPLETED") {
+      throw new Error("まだ支払いが完了していません");
+    }
+
+    // =========================
+    // ⏰ ここが超重要
+    // =========================
+
+    const now = new Date();
+
+    const lastSnapshot = await db
+      .collection("bookings")
+      .where("type", "==", "beerpong")
+      .where("paymentStatus", "==", "paid")
+      .orderBy("endAt", "desc")
+      .limit(1)
+      .get();
+
+    let startAt = now;
+    if (!lastSnapshot.empty) {
+      const lastEnd = lastSnapshot.docs[0].data().endAt?.toDate();
+      if (lastEnd && lastEnd > now) startAt = lastEnd;
+    }
+
+    const endAt = new Date(startAt.getTime() + 30 * 60000);
+
+    // 🟢 確定
+    await bookingRef.update({
+      paymentStatus: "paid",
+      paidAt: admin.firestore.FieldValue.serverTimestamp(),
+      startAt,
+      endAt,
+    });
+
+    logger.info("PayPay payment confirmed", { orderId });
+
+    return { success: true };
+  }
+);
 

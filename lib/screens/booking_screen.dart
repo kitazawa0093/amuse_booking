@@ -200,27 +200,22 @@ Future<String> getShopNextBeerpongSlotText() async {
 
   // ===== 次に使えるビアポン時間 =====
   
-
-
 Future<void> _submitBeerPongReservation() async {
   if (_isPaying) return;
-
-  setState(() {
-    _isPaying = true;
-  });
+  setState(() => _isPaying = true);
 
   final user = FirebaseAuth.instance.currentUser;
   if (user == null) {
-    setState(() {
-      _isPaying = false;
-    });
+    setState(() => _isPaying = false);
     return;
   }
 
   DocumentReference? bookingRef;
 
   try {
-    // ① 仮予約（unpaid）
+    // =========================
+    // ① 仮予約作成
+    // =========================
     bookingRef = await _firestore.collection('bookings').add({
       'type': 'beerpong',
       'uid': user.uid,
@@ -229,52 +224,63 @@ Future<void> _submitBeerPongReservation() async {
     });
 
     final peopleCount = int.tryParse(_beerPongPeopleController.text) ?? 1;
-    if (_paymentMethod == PaymentMethod.paypay) {
-      // ②-A PayPay決済
-      final callable = FirebaseFunctions.instance
-          .httpsCallable('createBeerpongPayPayPayment');
 
-      final result = await callable.call({
-        'peopleCount': peopleCount,
+    // =========================
+    // 💰 PayPay
+    // =========================
+    if (_paymentMethod == PaymentMethod.paypay) {
+      final create = FirebaseFunctions.instance.httpsCallable('createPayPayPayment');
+
+      final peopleCount = int.tryParse(_beerPongPeopleController.text) ?? 1;
+
+      final result = await create.call({
         'bookingId': bookingRef.id,
+        'amount': peopleCount * 700,
       });
 
-      final paymentUrl = result.data['paymentUrl'] as String?;
+      final paymentUrl = result.data['url'] as String?;
       if (paymentUrl == null || paymentUrl.isEmpty) {
-        throw Exception('PayPay paymentUrl is missing');
+        throw Exception('PayPay URL missing');
       }
 
       final uri = Uri.parse(paymentUrl);
-      final launched =
-          await launchUrl(uri, mode: LaunchMode.externalApplication);
-      if (!launched) {
-        throw Exception('Could not launch PayPay payment URL');
+      if (!await canLaunchUrl(uri)) {
+        throw Exception('Cannot open PayPay URL');
       }
 
+      await launchUrl(uri, mode: LaunchMode.externalApplication);
+
+      // ✅ ここで「完了ボタン」は押させない。Functionsで照会して確認する
       if (!mounted) return;
-      final confirmed = await showDialog<bool>(
+      showDialog(
         context: context,
-        builder: (context) => AlertDialog(
-          title: const Text('PayPay決済'),
-          content: const Text('PayPayでの決済が完了したら「完了」を押してください。'),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context, false),
-              child: const Text('キャンセル'),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.pop(context, true),
-              child: const Text('完了'),
-            ),
-          ],
+        barrierDismissible: false,
+        builder: (_) => const AlertDialog(
+          title: Text('決済確認中...'),
+          content: Text('PayPayの決済完了を確認しています。\nそのままお待ちください。'),
         ),
       );
 
-      if (confirmed != true) {
-        throw Exception('Payment cancelled');
+      final confirm = FirebaseFunctions.instance.httpsCallable('confirmPayPayPayment');
+      final confirmResult = await confirm.call({
+        'bookingId': bookingRef.id,
+      });
+
+      if (mounted) Navigator.pop(context); // 「決済確認中」閉じる
+
+      final ok = confirmResult.data['ok'] == true;
+      if (!ok) {
+        throw Exception(confirmResult.data['message'] ?? 'PayPay未決済');
       }
-    } else {
-      // ②-B Stripeカード決済
+
+      // ✅ ここまで来たら「Functionsが paid に更新済み」の前提
+    }
+
+
+    // =========================
+    // 💳 Stripe
+    // =========================
+    else {
       final callable =
           FirebaseFunctions.instance.httpsCallable('createBeerpongPayment');
 
@@ -284,7 +290,6 @@ Future<void> _submitBeerPongReservation() async {
       });
 
       final clientSecret = result.data['clientSecret'];
-      debugPrint('Stripe clientSecret: $clientSecret');
 
       await Stripe.instance.resetPaymentSheetCustomer();
       await Stripe.instance.initPaymentSheet(
@@ -296,7 +301,9 @@ Future<void> _submitBeerPongReservation() async {
       await Stripe.instance.presentPaymentSheet();
     }
 
-    // ⑤ 利用時間計算（店全体の最後の予約から積み上げ）
+    // =========================
+    // ⏰ 利用時間計算
+    // =========================
     final now = DateTime.now();
 
     final lastSnapshot = await _firestore
@@ -315,17 +322,7 @@ Future<void> _submitBeerPongReservation() async {
 
     final endAt = startAt.add(const Duration(minutes: 30));
 
-    // ⑥ paid に更新（※本番はFunctions側でpaid確定→Firestore更新が安全）
-    await bookingRef.update({
-      'paymentStatus': 'paid',
-      'startAt': startAt,
-      'endAt': endAt,
-      'paidAt': FieldValue.serverTimestamp(),
-      'peopleCount': peopleCount, // ←残しておくと便利
-    });
-    await Future.delayed(const Duration(milliseconds: 200));
 
-    // ✅ ここが重要：Future を更新してUI再描画
     _hasActiveReservation = true;
     _myBeerpongStatusFuture = getMyBeerpongStatusText();
     _shopNextSlotFuture = getShopNextBeerpongSlotText();
@@ -335,11 +332,7 @@ Future<void> _submitBeerPongReservation() async {
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text('決済が完了しました！')),
     );
-  } catch (e, st) {
-    debugPrint('決済エラー: $e');
-    debugPrintStack(stackTrace: st);
-
-    // 失敗したら cancelled に更新（仮予約のゴミを残さない）
+  } catch (e) {
     if (bookingRef != null) {
       await bookingRef.update({
         'paymentStatus': 'cancelled',
@@ -347,21 +340,17 @@ Future<void> _submitBeerPongReservation() async {
       });
     }
 
-    // （任意）失敗後も表示更新したい場合
-    _myBeerpongStatusFuture = getMyBeerpongStatusText();
-    _shopNextSlotFuture = getShopNextBeerpongSlotText();
-
-    setState(() {});
-
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text('決済エラー: $e')),
     );
   } finally {
-    setState(() {
-      _isPaying = false;
-    });
+    setState(() => _isPaying = false);
   }
 }
+
+
+
+
 
 
 

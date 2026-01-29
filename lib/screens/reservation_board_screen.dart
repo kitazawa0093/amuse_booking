@@ -262,14 +262,14 @@ class _ReservationBoardScreenState extends State<ReservationBoardScreen> {
       final functions = FirebaseFunctions.instance;
 
       final result = await functions
-          .httpsCallable('createBeerpongPayPayPayment')
+          .httpsCallable('createPayPayPayment')
           .call({
-            'peopleCount': people,
+            'amount': people * 700,
           });
 
-      final paymentUrl = result.data['paymentUrl'] as String?;
+      final paymentUrl = result.data['url'] as String?;
       if (paymentUrl == null || paymentUrl.isEmpty) {
-        throw Exception('PayPay paymentUrl is missing');
+        throw Exception('PayPay URL missing');
       }
 
       final uri = Uri.parse(paymentUrl);
@@ -567,6 +567,14 @@ class _ReservationBoardScreenState extends State<ReservationBoardScreen> {
       return;
     }
 
+    // ★ 重複チェック（決済前に実施）
+    if (_isOverlapping('ビアポン', start, adjustedEnd)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('その時間帯は既に予約があります')),
+      );
+      return;
+    }
+
     bool paymentOk = false;
     if (paymentMethod == 'paypay') {
       paymentOk = await _startPayPayPayment(people: people);
@@ -575,14 +583,6 @@ class _ReservationBoardScreenState extends State<ReservationBoardScreen> {
     }
 
     if (!paymentOk) return;
-
-    // ★ 重複チェック
-    if (_isOverlapping('ビアポン', start, adjustedEnd)) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('その時間帯は既に予約があります')),
-      );
-      return;
-    }
 
     setState(() {
       reservations['ビアポン']!.add(
