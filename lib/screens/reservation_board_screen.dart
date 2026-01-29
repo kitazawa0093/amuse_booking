@@ -3,6 +3,12 @@ import 'package:flutter/cupertino.dart';
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:flutter_stripe/flutter_stripe.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'dart:async';
+
+
+
 
 
 class Reservation {
@@ -33,6 +39,8 @@ class _ReservationBoardScreenState extends State<ReservationBoardScreen> {
 
   final int startHour = 18;
   final int endHour = 23;
+  late Map<String, List<Reservation>> reservations;
+
 
   // ===== 種目 =====
   final List<String> sports = const [
@@ -41,15 +49,60 @@ class _ReservationBoardScreenState extends State<ReservationBoardScreen> {
     'ダーツ１F',
     'ダーツ２F',
   ];
-
-  late final Map<String, List<Reservation>> reservations;
-
-
   @override
   void initState() {
     super.initState();
+
     reservations = {for (final s in sports) s: []};
+
+    // ===== 営業日ロジック（13時リセット）=====
+    final now = DateTime.now();
+    final today13 = DateTime(now.year, now.month, now.day, 13);
+
+    final businessStart = now.isBefore(today13)
+        ? today13.subtract(const Duration(days: 1))
+        : today13;
+
+    final businessEnd = businessStart.add(const Duration(days: 1));
+
+    // ===== Firestoreリアルタイム監視 =====
+    _bookingSub = FirebaseFirestore.instance
+        .collection('bookings')
+        .where('type', isEqualTo: 'beerpong')
+        .where('paymentStatus', isEqualTo: 'paid')
+        .where('startAt',
+            isGreaterThanOrEqualTo: Timestamp.fromDate(businessStart))
+        .where('startAt', isLessThan: Timestamp.fromDate(businessEnd))
+        .snapshots()
+        .listen((snapshot) {
+      final list = <Reservation>[];
+
+      for (final doc in snapshot.docs) {
+        final s = (doc['startAt'] as Timestamp).toDate();
+        final e = (doc['endAt'] as Timestamp).toDate();
+
+        list.add(
+          Reservation(
+            name: doc['name'],
+            start: TimeOfDay(hour: s.hour, minute: s.minute),
+            end: TimeOfDay(hour: e.hour, minute: e.minute),
+          ),
+        );
+      }
+
+      if (mounted) {
+        setState(() {
+          reservations['ビアポン'] = list;
+        });
+      }
+    });
   }
+  @override
+  void dispose() {
+    _bookingSub?.cancel();
+    super.dispose();
+  }
+
 
   // ===== 分 → px =====
   double _minuteToPx(int minuteFromStart) {
@@ -230,34 +283,48 @@ class _ReservationBoardScreenState extends State<ReservationBoardScreen> {
     );
   }
 
-  Future<bool> _startStripePayment({required int people}) async {
-    try {
-      final functions = FirebaseFunctions.instance;
+ Future<bool> _startStripePayment({
+  required int people,
+  required String bookingId,
+}) async {
+  try {
+    final functions = FirebaseFunctions.instance;
 
-      final result = await functions
-          .httpsCallable('createBeerpongPayment')
-          .call({
-            'peopleCount': people,
-          });
+    final result = await functions
+        .httpsCallable('createBeerpongPayment')
+        .call({
+          'peopleCount': people,
+          'bookingId': bookingId,
+        });
 
-      final clientSecret = result.data['clientSecret'];
+    final clientSecret = result.data['clientSecret'];
 
-      await Stripe.instance.initPaymentSheet(
-        paymentSheetParameters: SetupPaymentSheetParameters(
-          paymentIntentClientSecret: clientSecret,
-          merchantDisplayName: 'Beer Pong Reservation',
-        ),
-      );
+    await Stripe.instance.initPaymentSheet(
+      paymentSheetParameters: SetupPaymentSheetParameters(
+        paymentIntentClientSecret: clientSecret,
+        merchantDisplayName: 'Beer Pong Reservation',
+      ),
+    );
 
-      await Stripe.instance.presentPaymentSheet();
-      return true;
-    } catch (e) {
-      debugPrint('Stripe payment error: $e');
-      return false;
-    }
+    await Stripe.instance.presentPaymentSheet();
+
+    // 🔥 支払い確定をサーバーに通知
+    await functions.httpsCallable('confirmStripePayment').call({
+      'bookingId': bookingId,
+      'paymentIntentId': result.data['paymentIntentId'],
+    });
+
+    return true;
+  } catch (e) {
+    debugPrint('Stripe payment error: $e');
+    return false;
   }
+}
 
-  Future<bool> _startPayPayPayment({required int people}) async {
+Future<bool> _startPayPayPayment({
+  required int people,
+  required String bookingId,
+  }) async {
     try {
       final functions = FirebaseFunctions.instance;
 
@@ -265,23 +332,18 @@ class _ReservationBoardScreenState extends State<ReservationBoardScreen> {
           .httpsCallable('createPayPayPayment')
           .call({
             'amount': people * 700,
+            'orderId': bookingId,
           });
 
-      final paymentUrl = result.data['url'] as String?;
-      if (paymentUrl == null || paymentUrl.isEmpty) {
-        throw Exception('PayPay URL missing');
-      }
+      final paymentUrl = result.data['url'] as String;
+      await launchUrl(Uri.parse(paymentUrl),
+          mode: LaunchMode.externalApplication);
 
-      final uri = Uri.parse(paymentUrl);
-      final launched = await launchUrl(uri, mode: LaunchMode.externalApplication);
-      if (!launched) return false;
-
-      if (!mounted) return false;
       final confirmed = await showDialog<bool>(
         context: context,
         builder: (context) => AlertDialog(
           title: const Text('PayPay決済'),
-          content: const Text('PayPayでの決済が完了したら「完了」を押してください。'),
+          content: const Text('決済完了後「完了」を押してください'),
           actions: [
             TextButton(
               onPressed: () => Navigator.pop(context, false),
@@ -294,12 +356,22 @@ class _ReservationBoardScreenState extends State<ReservationBoardScreen> {
           ],
         ),
       );
-      return confirmed == true;
+
+      if (confirmed != true) return false;
+
+      // 🔥 サーバーで支払い確認
+      await functions
+          .httpsCallable('confirmPayPayPayment')
+          .call({'orderId': bookingId});
+
+      return true;
     } catch (e) {
       debugPrint('PayPay payment error: $e');
       return false;
     }
   }
+
+
 
 
   // ===== 左 =====
@@ -426,174 +498,206 @@ class _ReservationBoardScreenState extends State<ReservationBoardScreen> {
       ),
     );
   }
-  Future<void> _addBeerPongReservation() async {
-    Duration selected = const Duration(hours: 18);
-    final nameCtrl = TextEditingController();
-    int people = 2;
-    var paymentMethod = 'card'; // 'card' or 'paypay'
 
-    final ok = await showModalBottomSheet<bool>(
-      context: context,
-      isScrollControlled: true,
-      builder: (_) => StatefulBuilder(
-        builder: (context, setLocalState) => Padding(
-          padding: EdgeInsets.only(
-            bottom: MediaQuery.of(context).viewInsets.bottom,
-          ),
-          child: SizedBox(
-            height: 440,
-            child: Column(
-              children: [
-                const SizedBox(height: 12),
-                const Text(
-                  'ビアポン予約',
-                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-                ),
+Future<void> _addBeerPongReservation() async {
+  Duration selected = const Duration(hours: 18);
+  final nameCtrl = TextEditingController();
+  int people = 2;
+  var paymentMethod = 'card';
 
-                // ===== 名前（目立つ）=====
-                Expanded(
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      const Text(
-                        'お名前',
-                        style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
-                      ),
-                      const SizedBox(height: 12),
-                      _highlightNameField(nameCtrl),
-                    ],
-                  ),
-                ),
-
-                // ===== 時間スピナー =====
-                SizedBox(
-                  height: 140,
-                  child: CupertinoTimerPicker(
-                    mode: CupertinoTimerPickerMode.hm,
-                    minuteInterval: 1,
-                    initialTimerDuration: selected,
-                    onTimerDurationChanged: (d) => selected = d,
-                  ),
-                ),
-
-                // ===== 人数入力 =====
-                const SizedBox(height: 8),
-                Row(
+  final ok = await showModalBottomSheet<bool>(
+    context: context,
+    isScrollControlled: true,
+    builder: (_) => StatefulBuilder(
+      builder: (context, setLocalState) => Padding(
+        padding: EdgeInsets.only(
+          bottom: MediaQuery.of(context).viewInsets.bottom,
+        ),
+        child: SizedBox(
+          height: 440,
+          child: Column(
+            children: [
+              const SizedBox(height: 12),
+              const Text('ビアポン予約',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+              Expanded(
+                child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    IconButton(
-                      icon: const Icon(Icons.remove_circle_outline),
-                      onPressed: people > 1
-                          ? () => setLocalState(() => people--)
-                          : null,
-                    ),
-                    Text(
-                      '$people 人',
+                    const Text('お名前',
+                        style: TextStyle(
+                            fontSize: 18, fontWeight: FontWeight.w800)),
+                    const SizedBox(height: 12),
+                    _highlightNameField(nameCtrl),
+                  ],
+                ),
+              ),
+              SizedBox(
+                height: 140,
+                child: CupertinoTimerPicker(
+                  mode: CupertinoTimerPickerMode.hm,
+                  minuteInterval: 1,
+                  initialTimerDuration: selected,
+                  onTimerDurationChanged: (d) => selected = d,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  IconButton(
+                    icon: const Icon(Icons.remove_circle_outline),
+                    onPressed: people > 1
+                        ? () => setLocalState(() => people--)
+                        : null,
+                  ),
+                  Text('$people 人',
                       style: const TextStyle(
-                        fontSize: 22,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                    IconButton(
-                      icon: const Icon(Icons.add_circle_outline),
-                      onPressed: () => setLocalState(() => people++),
-                    ),
-                  ],
-                ),
-
-                Text(
-                  '合計 ¥${people * 700}',
-                  style: const TextStyle(
-                    fontSize: 18,
-                    fontWeight: FontWeight.bold,
+                          fontSize: 22, fontWeight: FontWeight.bold)),
+                  IconButton(
+                    icon: const Icon(Icons.add_circle_outline),
+                    onPressed: () => setLocalState(() => people++),
                   ),
-                ),
-
-                const SizedBox(height: 12),
-                // ===== 決済方法選択 =====
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    ChoiceChip(
-                      label: const Text('カード (Stripe)'),
-                      selected: paymentMethod == 'card',
-                      onSelected: (_) =>
-                          setLocalState(() => paymentMethod = 'card'),
-                    ),
-                    const SizedBox(width: 8),
-                    ChoiceChip(
-                      label: const Text('PayPay'),
-                      selected: paymentMethod == 'paypay',
-                      onSelected: (_) =>
-                          setLocalState(() => paymentMethod = 'paypay'),
-                    ),
-                  ],
-                ),
-
-                const SizedBox(height: 12),
-                FilledButton(
-                  onPressed: nameCtrl.text.trim().isEmpty
-                      ? null
-                      : () => Navigator.pop(context, true),
-                  child: const Text('決済へ進む'),
-                ),
-                const SizedBox(height: 12),
-              ],
-            ),
+                ],
+              ),
+              Text('合計 ¥${people * 700}',
+                  style: const TextStyle(
+                      fontSize: 18, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 12),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  ChoiceChip(
+                    label: const Text('カード'),
+                    selected: paymentMethod == 'card',
+                    onSelected: (_) =>
+                        setLocalState(() => paymentMethod = 'card'),
+                  ),
+                  const SizedBox(width: 8),
+                  ChoiceChip(
+                    label: const Text('PayPay'),
+                    selected: paymentMethod == 'paypay',
+                    onSelected: (_) =>
+                        setLocalState(() => paymentMethod = 'paypay'),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              FilledButton(
+                onPressed: nameCtrl.text.trim().isEmpty
+                    ? null
+                    : () => Navigator.pop(context, true),
+                child: const Text('決済へ進む'),
+              ),
+              const SizedBox(height: 12),
+            ],
           ),
         ),
       ),
+    ),
+  );
+
+  if (ok != true) return;
+
+  // ===== 時間計算 =====
+  final start = TimeOfDay(
+    hour: selected.inHours,
+    minute: selected.inMinutes % 60,
+  );
+  final endMinutes = selected.inMinutes + 30;
+  final end = TimeOfDay(
+    hour: endMinutes ~/ 60,
+    minute: endMinutes % 60,
+  );
+
+  // ローカル重複チェック
+  if (_isOverlapping('ビアポン', start, end)) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('その時間帯は既に予約があります')),
     );
-
-    if (ok != true) return;
-
-    final start = TimeOfDay(
-      hour: selected.inHours,
-      minute: selected.inMinutes % 60,
-    );
-    final endMinutes = selected.inMinutes + 30;
-    final defaultEnd = TimeOfDay(
-      hour: endMinutes ~/ 60,
-      minute: endMinutes % 60,
-    );
-
-    final adjustedEnd = _adjustEndTime('ビアポン', start, defaultEnd);
-
-    // 調整後の長さが0以下なら予約不可
-    if (_absMinute(adjustedEnd) - _absMinute(start) <= 0) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('その時間帯は予約が埋まっています')),
-      );
-      return;
-    }
-
-    // ★ 重複チェック（決済前に実施）
-    if (_isOverlapping('ビアポン', start, adjustedEnd)) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('その時間帯は既に予約があります')),
-      );
-      return;
-    }
-
-    bool paymentOk = false;
-    if (paymentMethod == 'paypay') {
-      paymentOk = await _startPayPayPayment(people: people);
-    } else {
-      paymentOk = await _startStripePayment(people: people);
-    }
-
-    if (!paymentOk) return;
-
-    setState(() {
-      reservations['ビアポン']!.add(
-        Reservation(
-          name: '${nameCtrl.text}（$people人）',
-          start: start,
-          end: adjustedEnd,
-        ),
-      );
-    });
+    return;
   }
+
+  // ===== 他端末予約チェック（Firestore）=====
+  // 🔥 まず時間を作る
+  final now = DateTime.now();
+  final bookingStart = DateTime(
+    now.year,
+    now.month,
+    now.day,
+    start.hour,
+    start.minute,
+  );
+  final bookingEnd = bookingStart.add(const Duration(minutes: 30));
+
+  // 🔥 そのあとクエリ
+  final snap = await FirebaseFirestore.instance
+      .collection('bookings')
+      .where('type', isEqualTo: 'beerpong')
+      .where('paymentStatus', isEqualTo: 'paid')
+      .where(
+        'startAt',
+        isGreaterThanOrEqualTo:
+            Timestamp.fromDate(bookingStart.subtract(const Duration(hours: 1))),
+      )
+      .where(
+        'startAt',
+        isLessThan:
+            Timestamp.fromDate(bookingEnd.add(const Duration(hours: 1))),
+      )
+      .get();
+
+
+
+  for (final doc in snap.docs) {
+    final s = (doc['startAt'] as Timestamp).toDate();
+    final e = (doc['endAt'] as Timestamp).toDate();
+
+    if (bookingStart.isBefore(e) && bookingEnd.isAfter(s)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('他の端末で予約が入りました')),
+      );
+      return;
+    }
+  }
+
+  // ===== Firestore 仮予約作成 =====
+  final user = FirebaseAuth.instance.currentUser!;
+  final bookingRef = FirebaseFirestore.instance.collection('bookings').doc();
+
+  await bookingRef.set({
+    'uid': user.uid,
+    'type': 'beerpong',
+    'people': people,
+    'name': nameCtrl.text.trim(),
+    'paymentStatus': 'pending',
+    'startAt': Timestamp.fromDate(bookingStart),
+    'endAt': Timestamp.fromDate(bookingEnd),   // ← 追加
+    'createdAt': FieldValue.serverTimestamp(),
+  });
+
+
+  // ===== 決済開始 =====
+  bool paymentOk = false;
+  if (paymentMethod == 'paypay') {
+    paymentOk =
+        await _startPayPayPayment(people: people, bookingId: bookingRef.id);
+  } else {
+    paymentOk =
+        await _startStripePayment(people: people, bookingId: bookingRef.id);
+  }
+
+  // ❌ 決済失敗 → 予約削除
+  if (!paymentOk) {
+    await bookingRef.delete();
+    return;
+  }
+
+  // ✅ 決済成功 → 予約確定
+  await bookingRef.update({
+    'paymentStatus': 'paid',
+  });
+}
   Widget _highlightNameField(TextEditingController controller) {
     return Container(
       width: MediaQuery.of(context).size.width * 0.8,

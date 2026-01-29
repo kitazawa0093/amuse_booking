@@ -9,95 +9,64 @@ declare const fetch: any;
 admin.initializeApp();
 const db = admin.firestore();
 
-
 export const createBeerpongPayment = onCall(
-  {
-    secrets: ["STRIPE_SECRET_KEY"],
-  },
+  { secrets: ["STRIPE_SECRET_KEY"] },
   async (request) => {
     logger.info("createBeerpongPayment called");
 
-    // 認証チェック
     if (!request.auth) {
-      logger.error("Unauthenticated request");
       throw new Error("ログインが必要です");
     }
 
-    // Secret存在チェック（値は出さない）
-    logger.info("STRIPE_SECRET_KEY exists:", {
-      exists: !!process.env.STRIPE_SECRET_KEY,
-    });
+    const { peopleCount, bookingId } = request.data;
 
-    if (!process.env.STRIPE_SECRET_KEY) {
-      logger.error("STRIPE_SECRET_KEY is missing");
-      throw new Error("決済設定が未完了です");
-    }
-
-    // Stripe初期化
-    const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
-
-
-    // 🔥重要：Stripeアカウント確認（世界ズレ検知）
-    try {
-      const account = await stripe.accounts.retrieve();
-
-      // emailは型に無い場合があるので、unknown→Record経由で安全に取る
-      const accountObj = account as unknown as Record<string, unknown>;
-      const email =
-  typeof accountObj["email"] === "string" ? accountObj["email"] : null;
-
-      logger.info("Stripe account info", {
-        id: account.id,
-        email,
-      });
-    } catch (e) {
-      logger.warn("Could not retrieve Stripe account info", e as Error);
-    }
-
-    const {peopleCount} = request.data;
-    logger.info("peopleCount", {peopleCount});
+    if (!bookingId) throw new Error("bookingId missing");
 
     if (typeof peopleCount !== "number" || peopleCount <= 0) {
       throw new Error("人数を正しく指定してください");
     }
 
+    const bookingRef = db.collection("bookings").doc(bookingId);
+    const bookingSnap = await bookingRef.get();
+
+    if (!bookingSnap.exists) throw new Error("予約が存在しません");
+
+    const booking = bookingSnap.data();
+
+    // 🔒 本人の予約かチェック
+    if (booking?.uid !== request.auth.uid) {
+      throw new Error("不正アクセス");
+    }
+
+    // 既に決済済みなら作らない
+    if (booking?.paymentStatus === "paid") {
+      throw new Error("すでに決済済みです");
+    }
+
+    const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
     const amount = peopleCount * 700;
 
-    try {
-      const paymentIntent = await stripe.paymentIntents.create({
-        amount,
-        currency: "jpy",
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount,
+      currency: "jpy",
+      automatic_payment_methods: { enabled: true },
+      metadata: {
+        uid: request.auth.uid,
+        type: "beerpong",
+        bookingId,
+      },
+    });
 
-        // ✅ PaymentSheetと相性が良い
-        automatic_payment_methods: {enabled: true},
-
-        metadata: {
-          uid: request.auth.uid,
-          type: "beerpong",
-        },
-      });
-
-      logger.info("PaymentIntent created", {
-        id: paymentIntent.id,
-        hasClientSecret: !!paymentIntent.client_secret,
-      });
-
-      // 🔥存在確認（これが通ればIntentはStripe上に存在する）
-      const check = await stripe.paymentIntents.retrieve(paymentIntent.id);
-      logger.info("PaymentIntent retrieve OK", {
-        id: check.id,
-        status: check.status,
-      });
-
-      return {
-        clientSecret: paymentIntent.client_secret,
-      };
-    } catch (error) {
-      logger.error("Stripe error", error as Error);
-      throw new Error("決済作成中にエラーが発生しました");
-    }
+    return {
+      clientSecret: paymentIntent.client_secret,
+      paymentIntentId: paymentIntent.id,
+    };
   }
 );
+
+
+
+
 
 export const createPayPayPayment = onCall(
   {
@@ -189,6 +158,82 @@ export const createPayPayPayment = onCall(
     }
   }
 );
+
+export const confirmStripePayment = onCall(
+  { secrets: ["STRIPE_SECRET_KEY"] },
+  async (request) => {
+    if (!request.auth) throw new Error("ログインが必要です");
+
+    const { bookingId, paymentIntentId } = request.data;
+    if (!bookingId || !paymentIntentId) {
+      throw new Error("パラメータ不足");
+    }
+
+    const bookingRef = db.collection("bookings").doc(bookingId);
+    const bookingSnap = await bookingRef.get();
+
+    if (!bookingSnap.exists) throw new Error("予約が存在しません");
+
+    const booking = bookingSnap.data();
+
+    // 👤 本人チェック
+    if (booking?.uid !== request.auth.uid) {
+      throw new Error("不正アクセス");
+    }
+
+    // すでに確定していれば終了
+    if (booking?.paymentStatus === "paid") {
+      return { success: true };
+    }
+
+    const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
+
+    // 💳 Stripe側で決済確認
+    const intent = await stripe.paymentIntents.retrieve(paymentIntentId);
+
+    if (intent.status !== "succeeded") {
+      throw new Error("支払いが完了していません");
+    }
+
+    // 🔒 この決済がこの予約のものか検証
+    if (intent.metadata.bookingId !== bookingId) {
+      throw new Error("支払い情報が一致しません");
+    }
+
+    // ⏰ 利用時間計算
+    const now = new Date();
+
+    const lastSnapshot = await db
+      .collection("bookings")
+      .where("type", "==", "beerpong")
+      .where("paymentStatus", "==", "paid")
+      .orderBy("endAt", "desc")
+      .limit(1)
+      .get();
+
+    let startAt = now;
+    if (!lastSnapshot.empty) {
+      const lastEnd = lastSnapshot.docs[0].data().endAt?.toDate();
+      if (lastEnd && lastEnd > now) startAt = lastEnd;
+    }
+
+    const endAt = new Date(startAt.getTime() + 30 * 60000);
+
+    // 🟢 確定
+    await bookingRef.update({
+      paymentStatus: "paid",
+      paidAt: admin.firestore.FieldValue.serverTimestamp(),
+      startAt,
+      endAt,
+    });
+
+    logger.info("Stripe payment confirmed", { bookingId });
+
+    return { success: true };
+  }
+);
+
+
 
 // ===== LINE Webhook =====
 function validateLineSignature(rawBody: Buffer, signature: string): boolean {
