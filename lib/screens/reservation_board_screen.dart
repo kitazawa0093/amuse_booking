@@ -36,10 +36,11 @@ class _ReservationBoardScreenState extends State<ReservationBoardScreen> {
   static const double rowHeight = 54;
   static const double leftColWidth = 220;
   static const double cellWidth = 60; // 10分 = 60px
-
+  
   final int startHour = 18;
   final int endHour = 23;
   late Map<String, List<Reservation>> reservations;
+  StreamSubscription<QuerySnapshot>? _bookingSub;
 
 
   // ===== 種目 =====
@@ -69,7 +70,7 @@ class _ReservationBoardScreenState extends State<ReservationBoardScreen> {
     _bookingSub = FirebaseFirestore.instance
         .collection('bookings')
         .where('type', isEqualTo: 'beerpong')
-        .where('paymentStatus', isEqualTo: 'paid')
+        .where('paymentStatus', whereIn: ['paid', 'pending'])
         .where('startAt',
             isGreaterThanOrEqualTo: Timestamp.fromDate(businessStart))
         .where('startAt', isLessThan: Timestamp.fromDate(businessEnd))
@@ -124,66 +125,24 @@ class _ReservationBoardScreenState extends State<ReservationBoardScreen> {
         padding: EdgeInsets.only(
           bottom: MediaQuery.of(context).viewInsets.bottom,
         ),
-        child: SizedBox(
-          height: 360,
+        child: SingleChildScrollView(
           child: Column(
+            mainAxisSize: MainAxisSize.min,
             children: [
               const SizedBox(height: 12),
-              const Text('予約入力', style: TextStyle(fontWeight: FontWeight.bold)),
+              const Text('予約入力',
+                  style: TextStyle(fontWeight: FontWeight.bold)),
 
-              Expanded(
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    const Text(
-                      'お名前を入力してください',
-                      style: TextStyle(
-                        fontSize: 18,
-                        fontWeight: FontWeight.w800,
-                      ),
-                    ),
-                    const SizedBox(height: 16),
+              const SizedBox(height: 20),
+              const Text('お名前を入力してください',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800)),
 
-      // ===== 強調された名前入力 =====
-                    Container(
-                      width: MediaQuery.of(context).size.width * 0.8,
-                      padding: const EdgeInsets.symmetric(horizontal: 16),
-                      decoration: BoxDecoration(
-                        color: Colors.grey.shade100,
-                        borderRadius: BorderRadius.circular(12),
-                        border: Border.all(
-                          color: Theme.of(context).colorScheme.primary,
-                          width: 2,
-                        ),
-                      ),
-                      child: TextField(
-                        controller: nameCtrl,
-                        autofocus: true,
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(
-                          fontSize: 20,
-                          fontWeight: FontWeight.bold,
-                        ),
-                        decoration: const InputDecoration(
-                          border: InputBorder.none,
-                          hintText: '例）田中',
-                        ),
-                      ),
-                    ),
+              const SizedBox(height: 16),
+              _highlightNameField(nameCtrl),
 
-                    const SizedBox(height: 12),
-                    const Text(
-                      '※ 予約バーに表示されます',
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: Colors.grey,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-
-              Expanded(
+              const SizedBox(height: 16),
+              SizedBox(
+                height: 140,
                 child: CupertinoTimerPicker(
                   mode: CupertinoTimerPickerMode.hm,
                   minuteInterval: 1,
@@ -191,6 +150,8 @@ class _ReservationBoardScreenState extends State<ReservationBoardScreen> {
                   onTimerDurationChanged: (d) => selected = d,
                 ),
               ),
+
+              const SizedBox(height: 12),
               Padding(
                 padding: const EdgeInsets.all(8),
                 child: FilledButton(
@@ -198,6 +159,7 @@ class _ReservationBoardScreenState extends State<ReservationBoardScreen> {
                   child: const Text('予約する（30分）'),
                 ),
               ),
+              const SizedBox(height: 12),
             ],
           ),
         ),
@@ -513,25 +475,19 @@ Future<void> _addBeerPongReservation() async {
         padding: EdgeInsets.only(
           bottom: MediaQuery.of(context).viewInsets.bottom,
         ),
-        child: SizedBox(
-          height: 440,
+        child: SingleChildScrollView(
           child: Column(
+             mainAxisSize: MainAxisSize.min,
             children: [
               const SizedBox(height: 12),
               const Text('ビアポン予約',
                   style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-              Expanded(
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    const Text('お名前',
-                        style: TextStyle(
-                            fontSize: 18, fontWeight: FontWeight.w800)),
-                    const SizedBox(height: 12),
-                    _highlightNameField(nameCtrl),
-                  ],
-                ),
-              ),
+              const SizedBox(height: 20),
+              const Text('お名前',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800)),
+              const SizedBox(height: 12),
+              _highlightNameField(nameCtrl),
+
               SizedBox(
                 height: 140,
                 child: CupertinoTimerPicker(
@@ -634,7 +590,7 @@ Future<void> _addBeerPongReservation() async {
   final snap = await FirebaseFirestore.instance
       .collection('bookings')
       .where('type', isEqualTo: 'beerpong')
-      .where('paymentStatus', isEqualTo: 'paid')
+      .where('paymentStatus', whereIn: ['paid', 'pending'])
       .where(
         'startAt',
         isGreaterThanOrEqualTo:
